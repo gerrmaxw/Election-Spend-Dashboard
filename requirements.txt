@@ -1,0 +1,7 @@
+streamlit>=1.38
+pandas>=2.2
+plotly>=5.24
+pydantic>=2.8
+rapidfuzz>=3.9
+openpyxl>=3.1
+requests>=2.32
