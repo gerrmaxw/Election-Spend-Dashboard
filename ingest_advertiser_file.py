@@ -16,12 +16,46 @@ import hashlib
 import re
 import sqlite3
 import sys
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from rapidfuzz import fuzz, process
+try:
+    from rapidfuzz import fuzz, process
+    HAS_RAPIDFUZZ = True
+except ImportError:  # Keep local ingests working before optional deps are installed.
+    HAS_RAPIDFUZZ = False
+
+    class _FuzzFallback:
+        @staticmethod
+        def partial_ratio(left: object, right: object) -> float:
+            return SequenceMatcher(None, str(left).lower(), str(right).lower()).ratio() * 100
+
+        @staticmethod
+        def WRatio(left: object, right: object) -> float:
+            return _FuzzFallback.partial_ratio(left, right)
+
+    class _ProcessFallback:
+        @staticmethod
+        def extractOne(query: object, choices: list[str], scorer=None, score_cutoff: float = 0):
+            scorer = scorer or _FuzzFallback.WRatio
+            best_choice = None
+            best_score = 0.0
+            best_index = -1
+            for idx, choice in enumerate(choices):
+                score = float(scorer(query, choice))
+                if score > best_score:
+                    best_choice = choice
+                    best_score = score
+                    best_index = idx
+            if best_choice is None or best_score < score_cutoff:
+                return None
+            return best_choice, best_score, best_index
+
+    fuzz = _FuzzFallback()
+    process = _ProcessFallback()
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -193,6 +227,12 @@ def _normalize_district(value: object) -> Optional[str]:
     text = re.sub(r"^(?:[A-Z]{2}[-\s])?(?:CD[-\s]?)?", "", text, flags=re.I).strip()
     if text.isdigit():
         return str(int(text))
+    try:
+        numeric = float(text)
+        if numeric.is_integer():
+            return str(int(numeric))
+    except ValueError:
+        pass
     return text.upper()
 
 
@@ -573,28 +613,86 @@ def _load_fec_lookup(db_path: Path, cycle: int = 2026) -> dict[str, dict]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        table_exists = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='fec_ie_by_committee'"
-        ).fetchone()
-        if table_exists is None:
-            return {}
-        rows = conn.execute(
-            """
-            SELECT committee_id, committee_name, candidate_id, candidate_name,
-                   office, state, district, total_spent
-            FROM fec_ie_by_committee
-            WHERE cycle = ? AND support_oppose = 'S' AND committee_name IS NOT NULL
-            ORDER BY committee_id, total_spent DESC
-            """,
-            (cycle,),
-        ).fetchall()
+        def _table_exists(name: str) -> bool:
+            return conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone() is not None
+
+        rows: list[dict] = []
+        if _table_exists("fec_ie_by_committee"):
+            rows.extend(
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT committee_id, committee_name, candidate_id, candidate_name,
+                           office, state, district, total_spent
+                    FROM fec_ie_by_committee
+                    WHERE cycle = ? AND support_oppose = 'S' AND committee_name IS NOT NULL
+                    ORDER BY committee_id, total_spent DESC
+                    """,
+                    (cycle,),
+                ).fetchall()
+            )
+        if _table_exists("fec_committee_summary") and _table_exists("fec_candidates"):
+            rows.extend(
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT cs.committee_id,
+                           cs.committee_name,
+                           COALESCE(NULLIF(cs.candidate_id, ''), l.candidate_id) AS candidate_id,
+                           fc.candidate_name,
+                           fc.office,
+                           fc.state,
+                           fc.district,
+                           COALESCE(cs.independent_expenditures, cs.total_disbursements, 0) AS total_spent
+                    FROM fec_committee_summary cs
+                    LEFT JOIN fec_candidate_committee_links l
+                      ON l.committee_id = cs.committee_id
+                     AND l.fec_election_year = ?
+                    LEFT JOIN fec_candidates fc
+                      ON fc.candidate_id = COALESCE(NULLIF(cs.candidate_id, ''), l.candidate_id)
+                    WHERE cs.election_year = ?
+                      AND cs.committee_name IS NOT NULL
+                      AND fc.candidate_id IS NOT NULL
+                    ORDER BY cs.committee_id, total_spent DESC
+                    """,
+                    (cycle, cycle),
+                ).fetchall()
+            )
+        if _table_exists("fec_committee_financial_summaries") and _table_exists("fec_candidates"):
+            rows.extend(
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT s.committee_id,
+                           s.committee_name,
+                           l.candidate_id,
+                           fc.candidate_name,
+                           fc.office,
+                           fc.state,
+                           fc.district,
+                           COALESCE(s.total_disbursements, 0) AS total_spent
+                    FROM fec_committee_financial_summaries s
+                    JOIN fec_candidate_committee_links l
+                      ON l.committee_id = s.committee_id
+                     AND l.fec_election_year = ?
+                    JOIN fec_candidates fc
+                      ON fc.candidate_id = l.candidate_id
+                    WHERE s.committee_name IS NOT NULL
+                    ORDER BY s.committee_id, total_spent DESC
+                    """,
+                    (cycle,),
+                ).fetchall()
+            )
     finally:
         conn.close()
 
     by_committee: dict[str, dict] = {}
     for row in rows:
-        committee_id = row["committee_id"]
-        if committee_id not in by_committee:
+        committee_id = row.get("committee_id")
+        if committee_id and committee_id not in by_committee:
             by_committee[committee_id] = dict(row)
 
     by_name: dict[str, dict] = {}
@@ -615,11 +713,16 @@ def resolve_via_fec(
         return None
 
     normalized = _normalize_committee_name(advertiser_name)
-    result = process.extractOne(normalized, list(fec_lookup.keys()), scorer=fuzz.WRatio, score_cutoff=threshold)
-    if result is None:
-        return None
-
-    committee_name, score, _ = result
+    if HAS_RAPIDFUZZ:
+        result = process.extractOne(normalized, list(fec_lookup.keys()), scorer=fuzz.WRatio, score_cutoff=threshold)
+        if result is None:
+            return None
+        committee_name, score, _ = result
+    else:
+        committee_name = normalized if normalized in fec_lookup else None
+        if committee_name is None:
+            return None
+        score = 100.0
     fec_row = fec_lookup[committee_name]
     fec_candidate_name = str(fec_row.get("candidate_name") or "").upper()
     surname = fec_candidate_name.split(",")[0].strip().lower() if "," in fec_candidate_name else ""

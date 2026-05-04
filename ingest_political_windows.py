@@ -51,6 +51,13 @@ def _iso(d) -> str | None:
     return d.strftime("%Y-%m-%d")
 
 
+def _s(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "null"} else text
+
+
 def load(path: Path | str = DATA_FILE) -> dict:
     data_file = Path(path)
     if not data_file.exists():
@@ -59,8 +66,11 @@ def load(path: Path | str = DATA_FILE) -> dict:
     df = pd.read_excel(data_file)
     df.columns = [c.strip() for c in df.columns]
 
-    expected = {"State", "Region", "Market/DMA", "WINDOW TYPE", "WINDOW OPEN DATE", "ELECTION DATE"}
+    market_col = "Market/DMA" if "Market/DMA" in df.columns else "Market" if "Market" in df.columns else None
+    expected = {"State", "Region", "WINDOW TYPE", "WINDOW OPEN DATE", "ELECTION DATE"}
     missing = expected - set(df.columns)
+    if market_col is None:
+        missing.add("Market/DMA")
     if missing:
         raise ValueError(f"Missing columns in xlsx: {missing}")
 
@@ -70,12 +80,12 @@ def load(path: Path | str = DATA_FILE) -> dict:
 
     inserted = updated = skipped = 0
     for _, row in df.iterrows():
-        state = (row["State"] or "").strip()
-        dma = (row["Market/DMA"] or "").strip()
-        wtype = (row["WINDOW TYPE"] or "").strip().upper()
+        state = _s(row["State"])
+        dma = _s(row[market_col])
+        wtype = _s(row["WINDOW TYPE"]).upper()
         open_d = _iso(row["WINDOW OPEN DATE"])
         elect_d = _iso(row["ELECTION DATE"])
-        region = (row["Region"] or "").strip() if isinstance(row["Region"], str) else None
+        region = _s(row["Region"]) or None
 
         if not (state and dma and wtype and open_d and elect_d):
             skipped += 1

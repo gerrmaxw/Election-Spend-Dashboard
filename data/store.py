@@ -397,6 +397,11 @@ class Store:
             "spend_records",
             "spend_aggregates",
             "fec_ie_by_committee",
+            "fec_candidates",
+            "fec_candidate_committee_links",
+            "fec_committee_summary",
+            "fec_leadership_pacs",
+            "pac_candidate_support",
             "analysis_candidate_view",
             "analysis_advertiser_view",
         ]

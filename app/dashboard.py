@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 import sqlite3
 import subprocess
 import sys
@@ -20,6 +21,8 @@ from build_analysis_report import main as refresh_analysis
 from config.settings import APP_NAME, DB_PATH, TARGET_STATES, TV_SPEND_FLOOR, UPLOAD_DIR
 from data.store import Store
 from ingest_advertiser_file import ingest
+from ingest_fec_files import detect_kind as detect_fec_file
+from ingest_fec_files import ingest as ingest_fec_file
 from ingest_house_roster import load as ingest_house_roster
 from ingest_political_windows import load as ingest_political_windows
 from ingest_polls import ingest as ingest_poll_file
@@ -204,6 +207,9 @@ def _file_headers(path: Path) -> set[str]:
 
 
 def ingest_uploaded_data_file(path: Path) -> dict:
+    if detect_fec_file(path):
+        summary = ingest_fec_file(path)
+        return {"file": path.name, "kind": "fec_local", **summary}
     headers = _file_headers(path)
     if {"STATE", "REGION", "MARKET/DMA", "WINDOW TYPE", "WINDOW OPEN DATE", "ELECTION DATE"}.issubset(headers):
         summary = ingest_political_windows(path)
@@ -683,9 +689,21 @@ def page_setup(
             window_count = _safe_count("political_windows")
             roster_count = _safe_count("house_roster")
             poll_count = _safe_count("polls")
+            fec_local_count = sum(
+                _safe_count(table)
+                for table in [
+                    "fec_candidates",
+                    "fec_candidate_committee_links",
+                    "fec_candidate_financial_summaries",
+                    "fec_committee_financial_summaries",
+                    "fec_committee_summary",
+                    "fec_leadership_pacs",
+                    "pac_candidate_support",
+                ]
+            )
     except Exception:
         spend_sources = pd.DataFrame()
-        aggregate_count = window_count = roster_count = poll_count = 0
+        aggregate_count = window_count = roster_count = poll_count = fec_local_count = 0
 
     st.subheader("Data Source Status")
     kpi_row(
@@ -695,6 +713,7 @@ def page_setup(
             ("Political Window Rows", format_int(window_count), format_timestamp(metadata.get("last_political_windows_ingest", metadata.get("last_analysis_refresh"))), "broadcast"),
             ("House Roster Districts", format_int(roster_count), format_timestamp(metadata.get("last_house_roster_ingest")), "positive"),
             ("Polling Rows", format_int(poll_count), format_timestamp(metadata.get("last_polling_ingest")), "cable"),
+            ("FEC / PAC Rows", format_int(fec_local_count), format_timestamp(metadata.get("last_fec_local_ingest", metadata.get("last_fec_refresh"))), "digital"),
         ]
     )
     if not spend_sources.empty:
@@ -802,8 +821,8 @@ def page_setup(
 
     st.subheader("File Upload + Refresh")
     upload_files = st.file_uploader(
-        "Upload spend, market-calendar, or House roster Excel files",
-        type=["xlsx", "xls", "csv"],
+        "Upload spend, polling, FEC/PAC, market-calendar, or House roster files",
+        type=["xlsx", "xls", "csv", "txt"],
         accept_multiple_files=True,
     )
     if st.button("Ingest Uploaded Files", type="primary", disabled=not upload_files):
@@ -846,6 +865,7 @@ def page_setup(
             {"Source": "Advertiser Ingest", "Timestamp": metadata.get("last_advertiser_ingest", "—")},
             {"Source": "CivicAPI", "Timestamp": metadata.get("last_civicapi_refresh", "—")},
             {"Source": "FEC IE", "Timestamp": metadata.get("last_fec_refresh", "—")},
+            {"Source": "Local FEC / PAC Files", "Timestamp": metadata.get("last_fec_local_ingest", "—")},
             {"Source": "Polling", "Timestamp": metadata.get("last_polling_ingest", "—")},
             {"Source": "Analysis", "Timestamp": metadata.get("last_analysis_refresh", "—")},
             {"Source": "Last Uploaded File", "Timestamp": metadata.get("last_uploaded_file", "—")},
@@ -1248,12 +1268,16 @@ def page_race_explorer(
     advertiser_df: pd.DataFrame,
     filters: dict[str, object],
 ) -> None:
-    filtered_candidates = apply_candidate_filters(candidate_df, filters, apply_tv_floor=False)
+    race_filters = dict(filters)
+    race_filters["require_spend"] = False
+    filtered_candidates = apply_candidate_filters(candidate_df, race_filters, apply_tv_floor=False)
     filtered_advertisers = apply_advertiser_filters(advertiser_df, filters, apply_tv_floor=False)
     page_header(
         "Race Explorer",
         "Pick a race, especially a US House district, and compare media mix, spend, and results candidate by candidate.",
     )
+    if filters.get("require_spend"):
+        st.caption("Race Explorer includes races without attributed spend so roster and incumbent context remain available.")
     if filtered_candidates.empty:
         st.info("No races match the current filters.")
         return
@@ -2474,6 +2498,9 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
     aggregate_df = load_spend_aggregates("|".join(metadata.values()))
     tab_candidates, tab_states, tab_markets = st.tabs(["Candidate Spend", "State Aggregates", "Market / DMA Aggregates"])
 
+    class _SkipCandidateSpendTab(Exception):
+        pass
+
     def _split_options(frame: pd.DataFrame, column: str) -> list[str]:
         if column not in frame.columns:
             return []
@@ -2490,7 +2517,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
             lambda value: bool({part.strip() for part in value.split(",") if part.strip()} & selected_set)
         )
 
-    with tab_candidates:
+    with tab_candidates, suppress(_SkipCandidateSpendTab):
         base = apply_candidate_filters(candidate_df, filters, apply_tv_floor=False)
         for column in ["source_data_types", "source_race_types", "source_party_affiliations", "advertiser_types", "agencies"]:
             if column not in base.columns:
@@ -2499,7 +2526,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
         base = base[base["total_attributed_spend"].fillna(0) > 0].copy()
         if base.empty:
             st.info("No candidate spend matches the current sidebar filters.")
-            return
+            raise _SkipCandidateSpendTab
 
         f1, f2 = st.columns(2)
         data_type_options = _split_options(base, "source_data_types")
@@ -2544,7 +2571,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
         ].copy()
         if base.empty:
             st.info("No candidates match those source metadata filters.")
-            return
+            raise _SkipCandidateSpendTab
 
         ctl1, ctl2, ctl3 = st.columns([1.2, 1, 1.2])
         with ctl1:
@@ -2556,7 +2583,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
             )
         if not selected_media:
             st.info("Select at least one media type.")
-            return
+            raise _SkipCandidateSpendTab
         selected_cols = [media_cols[m] for m in selected_media]
         excluded_cols = [col for media, col in media_cols.items() if media not in selected_media]
         if excluded_cols:
@@ -2566,7 +2593,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
         base = base[base["selected_spend"] > 0].copy()
         if base.empty:
             st.info("No candidates used only the selected media types.")
-            return
+            raise _SkipCandidateSpendTab
 
         max_spend = float(base["selected_spend"].max())
         with ctl2:
@@ -2582,7 +2609,7 @@ def page_spend_dashboard(candidate_df: pd.DataFrame, filters: dict[str, object])
         base = base[(base["selected_spend"] >= spend_range[0]) & (base["selected_spend"] <= spend_range[1])].copy()
         if base.empty:
             st.info("No candidates fall inside that spend range.")
-            return
+            raise _SkipCandidateSpendTab
 
         kpi_row(
             [
@@ -3538,105 +3565,336 @@ def page_case_study_finder(candidate_df: pd.DataFrame, filters: dict[str, object
 def page_pac_spend(filters: dict[str, object]) -> None:
     page_header(
         "PAC Spend Tracker",
-        "FEC independent-expenditure data: which PACs are spending, who they're supporting or opposing, and where the money is going.",
+        "FEC independent-expenditure, committee-summary, leadership PAC, and manual PAC-to-candidate support data.",
     )
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            ie = pd.read_sql_query(
-                "SELECT cycle, committee_id, committee_name, candidate_id, candidate_name, "
-                "office, state, district, support_oppose, total_spent, transaction_count "
-                "FROM fec_ie_by_committee WHERE cycle = 2026",
-                conn,
+
+    def _read_optional(conn: sqlite3.Connection, sql: str) -> pd.DataFrame:
+        try:
+            return pd.read_sql_query(sql, conn)
+        except Exception:
+            return pd.DataFrame()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        ie = _read_optional(
+            conn,
+            """
+            SELECT cycle, committee_id, committee_name, candidate_id, candidate_name,
+                   office, state, district, support_oppose, total_spent, transaction_count
+            FROM fec_ie_by_committee
+            WHERE cycle = 2026
+            """,
+        )
+        committee_summary = _read_optional(
+            conn,
+            """
+            SELECT committee_id, committee_name, committee_type, committee_designation,
+                   committee_state, committee_city, treasurer_name, candidate_id,
+                   election_year, individual_contributions, total_contributions,
+                   total_receipts, total_disbursements, independent_expenditures,
+                   cash_on_hand_close, coverage_start_date, coverage_end_date,
+                   debts_owed_by_committee, debts_owed_to_committee, source_file
+            FROM fec_committee_summary
+            WHERE election_year = 2026 OR election_year IS NULL
+            """,
+        )
+        committee_financial = _read_optional(
+            conn,
+            """
+            SELECT committee_id, committee_name, committee_type, committee_designation,
+                   NULL AS committee_state, NULL AS committee_city, NULL AS treasurer_name,
+                   NULL AS candidate_id, 2026 AS election_year,
+                   individual_contributions, NULL AS total_contributions,
+                   total_receipts, total_disbursements, NULL AS independent_expenditures,
+                   cash_on_hand_close, NULL AS coverage_start_date, coverage_end_date,
+                   debts_owed_by_committee, debts_owed_to_committee, source_file
+            FROM fec_committee_financial_summaries
+            """,
+        )
+        pac_support = _read_optional(
+            conn,
+            """
+            SELECT advertiser, committee_id, supported_candidates, support_method,
+                   grand_total, race_type, source_file
+            FROM pac_candidate_support
+            """,
+        )
+        leadership = _read_optional(
+            conn,
+            """
+            SELECT committee_id, committee_name, sponsor_name, cash_on_hand,
+                   coverage_end_date, total_disbursement, total_receipt, source_file
+            FROM fec_leadership_pacs
+            """,
+        )
+
+    if ie.empty and committee_summary.empty and committee_financial.empty and pac_support.empty and leadership.empty:
+        st.info("No FEC/PAC data loaded yet. Upload the FEC files on Setup / Data Health or run `ingest_all_sources.py`.")
+        return
+
+    tab_ie, tab_committees, tab_support, tab_leadership = st.tabs(
+        ["IE by Candidate", "Committee Summary", "PAC Support Lookup", "Leadership PACs"]
+    )
+
+    with tab_ie:
+        if ie.empty:
+            st.info("No Schedule E independent-expenditure rows are loaded yet. Committee-level FEC data is available in the other tabs.")
+        else:
+            office_map = {"S": "us_senate", "H": "us_house", "P": "president"}
+            ie["office_normalized"] = ie["office"].map(office_map).fillna(ie["office"])
+            ie["Stance"] = ie["support_oppose"].map({"S": "Support", "O": "Oppose"}).fillna(ie["support_oppose"])
+
+            states = filters["states"]
+            offices = filters["offices"]
+            working = ie.copy()
+            if "All" not in states:
+                working = working[working["state"].isin(states)]
+            if "All" not in offices:
+                working = working[working["office_normalized"].isin(offices)]
+
+            stance_filter = st.radio("Stance", ["All", "Support", "Oppose"], horizontal=True)
+            if stance_filter != "All":
+                working = working[working["Stance"] == stance_filter]
+
+            if working.empty:
+                st.info("No PAC spend matches the current filters.")
+            else:
+                total_spend = float(working["total_spent"].sum())
+                support_spend = float(working[working["Stance"] == "Support"]["total_spent"].sum())
+                oppose_spend = float(working[working["Stance"] == "Oppose"]["total_spent"].sum())
+                kpi_row([
+                    ("Total IE Spend", format_currency(total_spend), None),
+                    ("Support Spend", format_currency(support_spend), None),
+                    ("Oppose Spend", format_currency(oppose_spend), None),
+                    ("Active PACs", format_int(working["committee_id"].nunique()), None),
+                    ("Candidates Targeted", format_int(working["candidate_id"].nunique()), None),
+                ])
+
+                row1 = st.columns(2)
+                with row1[0]:
+                    top_pacs = (
+                        working.groupby("committee_name")["total_spent"].sum()
+                        .sort_values(ascending=True).tail(20).reset_index()
+                    )
+                    fig = px.bar(
+                        top_pacs,
+                        x="total_spent",
+                        y="committee_name",
+                        orientation="h",
+                        title="Top 20 PACs by IE Spend",
+                        color="total_spent",
+                        color_continuous_scale=["#EBF5FB", "#1F618D"],
+                    )
+                    fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with row1[1]:
+                    top_cands = (
+                        working.groupby(["candidate_name", "Stance"])["total_spent"].sum().reset_index()
+                        .sort_values("total_spent", ascending=False).head(40)
+                    )
+                    fig = px.bar(
+                        top_cands,
+                        x="total_spent",
+                        y="candidate_name",
+                        color="Stance",
+                        orientation="h",
+                        color_discrete_map={"Support": COLORS["won"], "Oppose": COLORS["lost"]},
+                        title="Top Candidates by IE Spend (support vs oppose)",
+                    )
+                    fig.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                state_roll = working.groupby("state")["total_spent"].sum().reset_index()
+                state_map = px.choropleth(
+                    state_roll,
+                    locations="state",
+                    locationmode="USA-states",
+                    scope="usa",
+                    color="total_spent",
+                    color_continuous_scale=["#EBF5FB", COLORS["cable_ctv_only"]],
+                    title="IE Spend by State",
+                )
+                state_map.update_layout(margin=dict(l=0, r=0, t=48, b=0))
+                st.plotly_chart(state_map, use_container_width=True)
+
+                st.subheader("PAC -> Candidate Detail")
+                detail = working.copy()
+                detail["Office"] = detail["office_normalized"].map(office_label)
+                detail = detail.rename(columns={
+                    "committee_name": "PAC",
+                    "candidate_name": "Candidate",
+                    "state": "State",
+                    "district": "District",
+                    "total_spent": "Spend",
+                    "transaction_count": "# Transactions",
+                })[["PAC", "Candidate", "Stance", "State", "Office", "District", "Spend", "# Transactions"]]
+                detail = detail.sort_values("Spend", ascending=False)
+                csv_download(detail, "Download PAC Spend", "pac_spend.csv")
+                st.dataframe(detail, width="stretch", hide_index=True)
+
+    with tab_committees:
+        committee_rows = pd.concat([committee_summary, committee_financial], ignore_index=True)
+        if committee_rows.empty:
+            st.info("No committee summary rows are loaded yet.")
+        else:
+            states = filters["states"]
+            if "committee_state" in committee_rows.columns and "All" not in states:
+                committee_rows = committee_rows[committee_rows["committee_state"].isin(states)]
+            numeric_cols = [
+                "total_receipts",
+                "total_disbursements",
+                "independent_expenditures",
+                "cash_on_hand_close",
+            ]
+            for col in numeric_cols:
+                if col in committee_rows.columns:
+                    committee_rows[col] = pd.to_numeric(committee_rows[col], errors="coerce").fillna(0)
+            kpi_row([
+                ("Committees", format_int(committee_rows["committee_id"].nunique()), None),
+                ("Receipts", format_compact_currency(committee_rows["total_receipts"].sum()), None),
+                ("Disbursements", format_compact_currency(committee_rows["total_disbursements"].sum()), None),
+                ("Independent Expenditures", format_compact_currency(committee_rows["independent_expenditures"].sum()), None),
+                ("Cash on Hand", format_compact_currency(committee_rows["cash_on_hand_close"].sum()), None),
+            ])
+
+            chart_source = (
+                committee_rows.groupby("committee_name", dropna=False)["total_disbursements"].sum()
+                .sort_values(ascending=True).tail(25).reset_index()
             )
-    except Exception:
-        st.info("No FEC IE data loaded yet. Run `fetch_fec_ie.py` to populate.")
-        return
-    if ie.empty:
-        st.info("No FEC IE data in the 2026 cycle yet.")
-        return
+            fig = px.bar(
+                chart_source,
+                x="total_disbursements",
+                y="committee_name",
+                orientation="h",
+                color="total_disbursements",
+                color_continuous_scale=["#EBF5FB", "#1F618D"],
+                title="Top Committees by Total Disbursements",
+            )
+            fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
 
-    office_map = {"S": "us_senate", "H": "us_house", "P": "president"}
-    ie["office_normalized"] = ie["office"].map(office_map).fillna(ie["office"])
-    ie["Stance"] = ie["support_oppose"].map({"S": "Support", "O": "Oppose"}).fillna(ie["support_oppose"])
+            display = committee_rows.rename(columns={
+                "committee_id": "Committee ID",
+                "committee_name": "Committee",
+                "committee_type": "Type",
+                "committee_designation": "Designation",
+                "committee_state": "State",
+                "candidate_id": "Candidate ID",
+                "total_receipts": "Receipts",
+                "total_disbursements": "Disbursements",
+                "independent_expenditures": "Independent Expenditures",
+                "cash_on_hand_close": "Cash on Hand",
+                "coverage_end_date": "Coverage End",
+                "source_file": "Source",
+            })
+            keep_cols = [
+                "Committee ID", "Committee", "Type", "Designation", "State",
+                "Candidate ID", "Receipts", "Disbursements",
+                "Independent Expenditures", "Cash on Hand", "Coverage End", "Source",
+            ]
+            display = display[[col for col in keep_cols if col in display.columns]].sort_values(
+                "Disbursements" if "Disbursements" in display.columns else display.columns[0],
+                ascending=False,
+            )
+            csv_download(display, "Download Committee Summary", "fec_committee_summary.csv")
+            st.dataframe(
+                display,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    c: st.column_config.NumberColumn(format="$%.0f")
+                    for c in ["Receipts", "Disbursements", "Independent Expenditures", "Cash on Hand"]
+                    if c in display.columns
+                },
+            )
 
-    states = filters["states"]
-    offices = filters["offices"]
-    working = ie.copy()
-    if "All" not in states:
-        working = working[working["state"].isin(states)]
-    if "All" not in offices:
-        working = working[working["office_normalized"].isin(offices)]
+    with tab_support:
+        if pac_support.empty:
+            st.info("No manual PAC-to-candidate support lookup rows are loaded yet.")
+        else:
+            view = pac_support.copy()
+            if "All" not in filters["offices"] and "race_type" in view.columns:
+                race_map = {"House": "us_house", "Senate": "us_senate", "Governor": "governor"}
+                view["office_normalized"] = view["race_type"].map(race_map)
+                view = view[view["office_normalized"].isin(filters["offices"])]
+            view["grand_total"] = pd.to_numeric(view["grand_total"], errors="coerce").fillna(0)
+            kpi_row([
+                ("Advertisers", format_int(view["advertiser"].nunique()), None),
+                ("Committee IDs Mapped", format_int(view["committee_id"].dropna().replace("", pd.NA).dropna().nunique()), None),
+                ("Rows With Candidate Notes", format_int(view["supported_candidates"].dropna().replace("", pd.NA).dropna().shape[0]), None),
+                ("Mapped Gross Spend", format_compact_currency(view["grand_total"].sum()), None),
+            ])
+            top = view.sort_values("grand_total", ascending=True).tail(25)
+            fig = px.bar(
+                top,
+                x="grand_total",
+                y="advertiser",
+                color="race_type",
+                orientation="h",
+                title="Manual PAC Support Lookup by Gross Spend",
+            )
+            fig.update_layout(margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+            display = view.rename(columns={
+                "advertiser": "Advertiser",
+                "committee_id": "Committee ID",
+                "supported_candidates": "Supported Candidates",
+                "support_method": "Support Method",
+                "grand_total": "Grand Total",
+                "race_type": "Race Type",
+                "source_file": "Source",
+            })
+            keep_cols = ["Advertiser", "Committee ID", "Supported Candidates", "Support Method", "Grand Total", "Race Type", "Source"]
+            display = display[[col for col in keep_cols if col in display.columns]].sort_values("Grand Total", ascending=False)
+            csv_download(display, "Download PAC Support Lookup", "pac_support_lookup.csv")
+            st.dataframe(display, width="stretch", hide_index=True)
 
-    stance_filter = st.radio("Stance", ["All", "Support", "Oppose"], horizontal=True)
-    if stance_filter != "All":
-        working = working[working["Stance"] == stance_filter]
-
-    if working.empty:
-        st.info("No PAC spend matches the current filters.")
-        return
-
-    total_spend = float(working["total_spent"].sum())
-    support_spend = float(working[working["Stance"] == "Support"]["total_spent"].sum())
-    oppose_spend = float(working[working["Stance"] == "Oppose"]["total_spent"].sum())
-    kpi_row([
-        ("Total IE Spend", format_currency(total_spend), None),
-        ("Support Spend", format_currency(support_spend), None),
-        ("Oppose Spend", format_currency(oppose_spend), None),
-        ("Active PACs", format_int(working["committee_id"].nunique()), None),
-        ("Candidates Targeted", format_int(working["candidate_id"].nunique()), None),
-    ])
-
-    row1 = st.columns(2)
-    with row1[0]:
-        top_pacs = (
-            working.groupby("committee_name")["total_spent"].sum()
-            .sort_values(ascending=True).tail(20).reset_index()
-        )
-        fig = px.bar(
-            top_pacs, x="total_spent", y="committee_name", orientation="h",
-            title="Top 20 PACs by IE Spend",
-            color="total_spent",
-            color_continuous_scale=["#EBF5FB", "#1F618D"],
-        )
-        fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-    with row1[1]:
-        top_cands = (
-            working.groupby(["candidate_name", "Stance"])["total_spent"].sum().reset_index()
-            .sort_values("total_spent", ascending=False).head(40)
-        )
-        fig = px.bar(
-            top_cands, x="total_spent", y="candidate_name", color="Stance", orientation="h",
-            color_discrete_map={"Support": COLORS["won"], "Oppose": COLORS["lost"]},
-            title="Top Candidates by IE Spend (support vs oppose)",
-        )
-        fig.update_layout(yaxis=dict(autorange="reversed"), margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
-
-    state_roll = working.groupby("state")["total_spent"].sum().reset_index()
-    state_map = px.choropleth(
-        state_roll, locations="state", locationmode="USA-states", scope="usa",
-        color="total_spent", color_continuous_scale=["#EBF5FB", COLORS["cable_ctv_only"]],
-        title="IE Spend by State",
-    )
-    state_map.update_layout(margin=dict(l=0, r=0, t=48, b=0))
-    st.plotly_chart(state_map, use_container_width=True)
-
-    st.subheader("PAC → Candidate Detail")
-    detail = working.copy()
-    detail["Office"] = detail["office_normalized"].map(office_label)
-    detail = detail.rename(columns={
-        "committee_name": "PAC",
-        "candidate_name": "Candidate",
-        "state": "State",
-        "district": "District",
-        "total_spent": "Spend",
-        "transaction_count": "# Transactions",
-    })[["PAC", "Candidate", "Stance", "State", "Office", "District", "Spend", "# Transactions"]]
-    detail = detail.sort_values("Spend", ascending=False)
-    csv_download(detail, "Download PAC Spend", "pac_spend.csv")
-    st.dataframe(detail, width="stretch", hide_index=True)
+    with tab_leadership:
+        if leadership.empty:
+            st.info("No leadership PAC rows are loaded yet.")
+        else:
+            view = leadership.copy()
+            for col in ["cash_on_hand", "total_disbursement", "total_receipt"]:
+                view[col] = pd.to_numeric(view[col], errors="coerce").fillna(0)
+            kpi_row([
+                ("Leadership PACs", format_int(view["committee_id"].nunique()), None),
+                ("Cash on Hand", format_compact_currency(view["cash_on_hand"].sum()), None),
+                ("Receipts", format_compact_currency(view["total_receipt"].sum()), None),
+                ("Disbursements", format_compact_currency(view["total_disbursement"].sum()), None),
+            ])
+            chart_source = view.sort_values("cash_on_hand", ascending=True).tail(25)
+            fig = px.bar(
+                chart_source,
+                x="cash_on_hand",
+                y="committee_name",
+                color="cash_on_hand",
+                color_continuous_scale=["#EBF5FB", "#1F618D"],
+                orientation="h",
+                title="Leadership PACs by Cash on Hand",
+            )
+            fig.update_layout(coloraxis_showscale=False, margin=dict(l=0, r=0, t=48, b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+            display = view.rename(columns={
+                "committee_id": "Committee ID",
+                "committee_name": "Leadership PAC",
+                "sponsor_name": "Sponsor",
+                "cash_on_hand": "Cash on Hand",
+                "coverage_end_date": "Coverage End",
+                "total_disbursement": "Disbursements",
+                "total_receipt": "Receipts",
+                "source_file": "Source",
+            }).sort_values("Cash on Hand", ascending=False)
+            csv_download(display, "Download Leadership PACs", "leadership_pacs.csv")
+            st.dataframe(
+                display,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    c: st.column_config.NumberColumn(format="$%.0f")
+                    for c in ["Cash on Hand", "Disbursements", "Receipts"]
+                    if c in display.columns
+                },
+            )
 
 
 def _letter_grade(score: float) -> str:
